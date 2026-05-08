@@ -1,0 +1,126 @@
+name: Build macOS App
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-latest    # Apple Silicon M1/M2/M3
+            arch: arm64
+            label: "Apple Silicon (M1+)"
+          - runner: macos-13        # Last Intel runner on GitHub
+            arch: x86_64
+            label: "Intel"
+
+    runs-on: ${{ matrix.runner }}
+    name: Build macOS ${{ matrix.label }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: |
+          pip install --upgrade pip
+          pip install pyinstaller mutagen Pillow yt-dlp
+
+      - name: Download static ffmpeg
+        run: |
+          # Pick the right ffmpeg build for this arch
+          if [ "${{ matrix.arch }}" = "arm64" ]; then
+            curl -L "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg.zip
+          else
+            curl -L "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg.zip
+          fi
+          unzip -o ffmpeg.zip ffmpeg
+          chmod +x ffmpeg
+          file ffmpeg
+          echo "ffmpeg arch: $(file ffmpeg)"
+
+      - name: Build .app with PyInstaller
+        run: |
+          SCRIPT=$(ls music_converter.py music_manager.py 2>/dev/null | head -1)
+          echo "Building $SCRIPT for ${{ matrix.arch }}"
+
+          python -m PyInstaller \
+            --windowed \
+            --clean \
+            --noconfirm \
+            --add-binary "ffmpeg:." \
+            --collect-all mutagen \
+            --collect-all PIL \
+            --collect-all yt_dlp \
+            --hidden-import=mutagen \
+            --hidden-import=mutagen.id3 \
+            --hidden-import=mutagen.flac \
+            --hidden-import=mutagen.mp3 \
+            --hidden-import=mutagen.mp4 \
+            --hidden-import=mutagen.oggvorbis \
+            --hidden-import=mutagen.easyid3 \
+            --hidden-import=mutagen._tags \
+            --hidden-import=mutagen._util \
+            --hidden-import=PIL.Image \
+            --hidden-import=PIL.ImageTk \
+            --hidden-import=PIL.JpegImagePlugin \
+            --hidden-import=PIL.PngImagePlugin \
+            --hidden-import=yt_dlp \
+            --name "MusicManager" \
+            "$SCRIPT"
+
+      - name: Verify .app
+        run: |
+          [ -d "dist/MusicManager.app" ] || (echo "ERROR: .app not found" && exit 1)
+          echo "Size: $(du -sh dist/MusicManager.app | cut -f1)"
+          echo "Binary arch: $(file dist/MusicManager.app/Contents/MacOS/MusicManager)"
+
+      - name: Create .dmg
+        run: |
+          brew install create-dmg
+
+          DMG_NAME="MusicManager-macOS-${{ matrix.arch }}.dmg"
+
+          create-dmg \
+            --volname "Music Manager" \
+            --window-pos 200 120 \
+            --window-size 660 400 \
+            --icon-size 128 \
+            --icon "MusicManager.app" 180 180 \
+            --hide-extension "MusicManager.app" \
+            --app-drop-link 480 180 \
+            "$DMG_NAME" \
+            "dist/MusicManager.app" \
+          || \
+          hdiutil create \
+            -volname "MusicManager" \
+            -srcfolder dist/MusicManager.app \
+            -ov -format UDZO \
+            "$DMG_NAME"
+
+          echo "DMG: $(ls -lh $DMG_NAME)"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: MusicManager-macOS-${{ matrix.arch }}
+          path: MusicManager-macOS-${{ matrix.arch }}.dmg
+          retention-days: 30
+
+      - name: Attach to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          files: MusicManager-macOS-${{ matrix.arch }}.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
