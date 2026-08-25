@@ -2,7 +2,7 @@
 """
 Music Manager - Cross-platform GUI tool for:
  - Editing music file metadata (batch support)
- - Converting FLAC to MP3
+ - Converting FLAC to MP3 / ALAC
  - Extracting audio from video files
  - Converting AVI/MOV to MP4
 
@@ -236,6 +236,22 @@ def flac_to_mp3(src, quality="320k", dst=None):
     ])
     return ok, msg
 
+def flac_to_alac(src, dst=None):
+    if dst is None:
+        dst = Path(src).with_suffix(".m4a")
+    dst = Path(dst)
+    if dst.exists():
+        return True, f"Skipped (exists): {dst.name}"
+    ok, msg = run_ffmpeg([
+        "-i", str(src),
+        "-vn",
+        "-codec:a", "alac",
+        "-map_metadata", "0",
+        "-loglevel", "error",
+        "-y", str(dst)
+    ])
+    return ok, msg
+
 def extract_audio(src, fmt="mp3", dst=None, quality="320k"):
     if dst is None:
         dst = Path(src).with_suffix(f".{fmt}")
@@ -275,16 +291,28 @@ ACCENT  = "#7c5cbf"
 FG      = "#e0e0f0"
 FG2     = "#a0a0c0"
 BTN_BG  = "#3a3a5a"
+# macOS draws native light buttons and ignores -bg no matter what bd is, so
+# button text has to be dark there. Other platforms honour BTN_BG (dark) and
+# need light text instead.
+IS_MAC   = sys.platform == "darwin"
+BTN_FG   = "#000000" if IS_MAC else FG
+BTN_FG2  = "#4a4a4a" if IS_MAC else FG2
+BTN_FGD  = "#8a8a8a" if IS_MAC else FG2   # disabled
 SEL_BG  = "#4a4a7a"
-FONT    = ("Segoe UI", 10) if sys.platform == "win32" else ("Helvetica", 11)
+FONT    = ("Segoe UI", 10) if sys.platform == "win32" else ("Helvetica Neue", 12)
 FONT_B  = (FONT[0], FONT[1], "bold")
 
 def styled_btn(parent, text, command, **kw):
     kw.setdefault("bg", BTN_BG)
-    kw.setdefault("fg", FG)
+    kw.setdefault("fg", BTN_FG)
     kw.setdefault("activebackground", ACCENT)
-    kw.setdefault("activeforeground", "#fff")
+    kw.setdefault("activeforeground", BTN_FG if IS_MAC else "#fff")
+    kw.setdefault("disabledforeground", BTN_FGD)
     kw.setdefault("relief", "flat")
+    # bd/highlightthickness must be 0: with a border, macOS draws a native
+    # light button and ignores -bg, leaving pale text on white.
+    kw.setdefault("bd", 0)
+    kw.setdefault("highlightthickness", 0)
     kw.setdefault("padx", 10)
     kw.setdefault("pady", 4)
     kw.setdefault("font", FONT)
@@ -302,6 +330,17 @@ def styled_entry(parent, textvariable=None, **kw):
                  bg=BG2, fg=FG, insertbackground=FG,
                  relief="flat", font=FONT, **kw)
     return e
+
+def styled_option(parent, variable, *values):
+    om = tk.OptionMenu(parent, variable, *values)
+    om.config(bg=BTN_BG, fg=BTN_FG, activebackground=ACCENT,
+              activeforeground=BTN_FG if IS_MAC else "#fff", relief="flat",
+              font=FONT, bd=0, highlightthickness=0, indicatoron=False,
+              padx=10, pady=4)
+    om["menu"].config(bg=BTN_BG, fg=BTN_FG, font=FONT,
+                      activebackground=ACCENT,
+                      activeforeground=BTN_FG if IS_MAC else "#fff")
+    return om
 
 
 # ---------------------------------------------------------------------------
@@ -514,11 +553,8 @@ class MetadataTab(ttk.Frame):
         size_row.pack(anchor="w")
         styled_label(size_row, "Resize:", fg=FG2).pack(side="left")
         self.art_size = tk.StringVar(value="500")
-        om = tk.OptionMenu(size_row, self.art_size,
+        om = styled_option(size_row, self.art_size,
                            "Original","300","500","600","800","1000","1200")
-        om.config(bg=BTN_BG, fg=FG, activebackground=ACCENT,
-                  activeforeground="#fff", relief="flat", font=FONT)
-        om["menu"].config(bg=BTN_BG, fg=FG, font=FONT)
         om.pack(side="left", padx=4)
 
         # Divider
@@ -722,7 +758,7 @@ class MetadataTab(ttk.Frame):
         if not PILLOW_OK:
             return
         try:
-            from PIL import ImageTk
+            from PIL import Image, ImageTk
             img = img.copy().convert("RGB")
             img.thumbnail((64, 64), Image.LANCZOS)
             photo = ImageTk.PhotoImage(img)
@@ -797,7 +833,7 @@ class MetadataTab(ttk.Frame):
 
         threading.Thread(target=run, daemon=True).start()
 # ---------------------------------------------------------------------------
-# Tab: FLAC → MP3
+# Tab: FLAC → MP3 / ALAC
 # ---------------------------------------------------------------------------
 
 class FlacTab(ttk.Frame):
@@ -813,14 +849,18 @@ class FlacTab(ttk.Frame):
         styled_btn(top, "📁  Add Folder (recursive)",  self._add_folder).pack(side="left", padx=4)
         styled_btn(top, "🗑  Clear",                   self._clear).pack(side="left", padx=4)
 
+        format_frame = tk.Frame(top, bg=BG)
+        format_frame.pack(side="left", padx=20)
+        styled_label(format_frame, "Output format:").pack(side="left")
+        self.output_format = tk.StringVar(value="mp3")
+        format_menu = styled_option(format_frame, self.output_format, "mp3", "alac")
+        format_menu.pack(side="left", padx=4)
+
         q_frame = tk.Frame(top, bg=BG)
         q_frame.pack(side="left", padx=20)
         styled_label(q_frame, "Quality:").pack(side="left")
         self.quality = tk.StringVar(value="320k")
-        om = tk.OptionMenu(q_frame, self.quality, "128k", "192k", "256k", "320k")
-        om.config(bg=BTN_BG, fg=FG, activebackground=ACCENT,
-                  activeforeground="#fff", relief="flat", font=FONT)
-        om["menu"].config(bg=BTN_BG, fg=FG, font=FONT)
+        om = styled_option(q_frame, self.quality, "128k", "192k", "256k", "320k")
         om.pack(side="left", padx=4)
 
         dest = tk.Frame(self, bg=BG2, pady=5)
@@ -905,11 +945,16 @@ class FlacTab(ttk.Frame):
 
         def run():
             ok = err = skip = 0
+            output_format = self.output_format.get()
             for i, f in enumerate(files):
                 dest_dir = self._get_dest(f)
                 dest_dir.mkdir(parents=True, exist_ok=True)
-                dst = dest_dir / Path(f).with_suffix(".mp3").name
-                success, msg = flac_to_mp3(f, quality, dst)
+                if output_format == "alac":
+                    dst = dest_dir / Path(f).with_suffix(".m4a").name
+                    success, msg = flac_to_alac(f, dst)
+                else:
+                    dst = dest_dir / Path(f).with_suffix(".mp3").name
+                    success, msg = flac_to_mp3(f, quality, dst)
                 if "Skipped" in msg:
                     skip += 1
                 elif success:
@@ -924,10 +969,10 @@ class FlacTab(ttk.Frame):
             summary = f"Converted: {ok}  Skipped: {skip}  Errors: {err}"
             self.status_var.set(f"Done. {summary}")
             if errors:
-                notify("Music Manager — Errors", f"{len(errors)} file(s) failed during FLAC conversion")
+                notify("Music Manager — Errors", f"{len(errors)} file(s) failed during FLAC to {output_format} conversion")
                 show_errors(self, errors)
             else:
-                notify("Music Manager — Done", f"FLAC conversion complete. {summary}")
+                notify("Music Manager — Done", f"FLAC to {output_format} conversion complete. {summary}")
 
         threading.Thread(target=run, daemon=True).start()
 class ExtractTab(ttk.Frame):
@@ -947,10 +992,7 @@ class ExtractTab(ttk.Frame):
         fmt_frame.pack(side="left", padx=20)
         styled_label(fmt_frame, "Output format:").pack(side="left")
         self.fmt = tk.StringVar(value="mp3")
-        om = tk.OptionMenu(fmt_frame, self.fmt, "mp3", "aac", "flac", "wav", "ogg")
-        om.config(bg=BTN_BG, fg=FG, activebackground=ACCENT,
-                  activeforeground="#fff", relief="flat", font=FONT)
-        om["menu"].config(bg=BTN_BG, fg=FG, font=FONT)
+        om = styled_option(fmt_frame, self.fmt, "mp3", "aac", "flac", "wav", "ogg")
         om.pack(side="left", padx=4)
 
         dest = tk.Frame(self, bg=BG2, pady=5)
@@ -1218,10 +1260,7 @@ class YouTubeTab(ttk.Frame):
             "Best": "best", "1080p": "1080", "720p": "720",
             "480p": "480",  "320k audio": "320k", "192k audio": "192k"
         }
-        om = tk.OptionMenu(opts, self.quality_var, *self._quality_map.keys())
-        om.config(bg=BTN_BG, fg=FG, activebackground=ACCENT,
-                  activeforeground="#fff", relief="flat", font=FONT)
-        om["menu"].config(bg=BTN_BG, fg=FG, font=FONT)
+        om = styled_option(opts, self.quality_var, *self._quality_map.keys())
         om.pack(side="left", padx=4)
 
         tk.Frame(opts, bg=BG2, width=1, height=20).pack(side="left", padx=12)
@@ -1468,49 +1507,64 @@ class App(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("🎵  Music Manager")
-        self.geometry("900x600")
-        self.minsize(760, 480)
+        # Widest tab toolbar (FLAC) needs ~960px; anything narrower clips it.
+        self.geometry("1000x660")
+        self.minsize(960, 500)
         self.configure(bg=BG)
-
-        # ttk style
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("TNotebook", background=BG, borderwidth=0)
-        style.configure("TNotebook.Tab", background=BTN_BG, foreground=FG,
-                         font=FONT, padding=[12, 5])
-        style.map("TNotebook.Tab",
-                  background=[("selected", ACCENT)],
-                  foreground=[("selected", "#fff")])
-        style.configure("Dark.TFrame", background=BG)
-
-        # Header
-        hdr = tk.Frame(self, bg=ACCENT, height=48)
-        hdr.pack(fill="x")
-        hdr.pack_propagate(False)
-        tk.Label(hdr, text="  🎵  Music Manager",
-                 bg=ACCENT, fg="#fff", font=(FONT[0], 14, "bold")).pack(side="left", padx=12)
 
         ffmpeg_status = "ffmpeg: ✓" if FFMPEG else "ffmpeg: ✗"
         mut_status  = "mutagen: ✓" if MUTAGEN_OK else "mutagen: ✗"
         pil_status  = "Pillow: ✓"  if PILLOW_OK  else "Pillow: ✗"
         ytdlp_status= "yt-dlp: ✓"  if YTDLP_OK   else "yt-dlp: ✗"
-        tk.Label(hdr, text=f"  {ffmpeg_status}   {mut_status}   {pil_status}   {ytdlp_status}",
-                 bg=ACCENT, fg="#ddd", font=(FONT[0], 8)).pack(side="right", padx=12)
+        header = tk.Frame(self, bg=ACCENT, height=48)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        tk.Label(header, text="🎵  Music Manager", bg=ACCENT, fg="#fff",
+             font=(FONT[0], 14, "bold")).pack(side="left", padx=18)
+        tk.Label(header,
+             text=f"{ffmpeg_status}   {mut_status}   {pil_status}   {ytdlp_status}",
+             bg=ACCENT, fg="#ddd", font=(FONT[0], 8)).pack(side="right", padx=18)
 
-        # Tabs
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True)
+        style = ttk.Style(self)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+        style.configure("Dark.TFrame", background=BG)
+
+        self.tab_names = [
+            "🏷  Metadata Editor", "🔄  FLAC → MP3 / ALAC",
+            "🎬  Audio Extractor", "📹  Video → MP4", "▶  YouTube",
+        ]
+        self.tab_bar = tk.Frame(self, bg=BG2, height=38)
+        self.tab_bar.pack(fill="x")
+        self.tab_bar.pack_propagate(False)
+        self.tab_buttons = []
+        for index, name in enumerate(self.tab_names):
+            button = tk.Button(
+                self.tab_bar, text=name, command=lambda i=index: self._select_tab(i),
+                bg=BG2, fg=BTN_FG2, activebackground=ACCENT,
+                activeforeground=BTN_FG if IS_MAC else "#fff", relief="flat", bd=0,
+                font=FONT, cursor="hand2", padx=10, pady=4
+            )
+            button.pack(side="left", fill="both", expand=True, padx=1, pady=2)
+            self.tab_buttons.append(button)
+
+        page_container = tk.Frame(self, bg=BG)
+        page_container.pack(fill="both", expand=True)
+        page_container.rowconfigure(0, weight=1)
+        page_container.columnconfigure(0, weight=1)
 
         tabs = [
-            ("🏷  Metadata Editor", MetadataTab),
-            ("🔄  FLAC → MP3",      FlacTab),
-            ("🎬  Audio Extractor", ExtractTab),
-            ("📹  Video → MP4",     VideoConvTab),
-            ("▶  YouTube",          YouTubeTab),
+            (self.tab_names[0], MetadataTab), (self.tab_names[1], FlacTab),
+            (self.tab_names[2], ExtractTab), (self.tab_names[3], VideoConvTab),
+            (self.tab_names[4], YouTubeTab),
         ]
-        for name, cls in tabs:
-            frame = cls(nb)
-            nb.add(frame, text=f"  {name}  ")
+        self.page_container = page_container
+        self.pages = [cls(page_container) for _, cls in tabs]
+        for page in self.pages:
+            page.grid(row=0, column=0, sticky="nsew")
+        self.selected_tab = 0
+        self._refresh_tabs()
+        self._show_tab(0)
 
         # Deps warning
         missing = []
@@ -1526,6 +1580,27 @@ class App(tk.Tk):
                                  f"{'  +  install ffmpeg from https://ffmpeg.org' if 'ffmpeg' in missing else ''}",
                      bg="#4a2020", fg="#ffaaaa", font=(FONT[0], 9)).pack(padx=10, pady=4)
 
+    def _refresh_tabs(self):
+        for index, button in enumerate(self.tab_buttons):
+            selected = index == self.selected_tab
+            button.configure(
+                bg=ACCENT if selected else BG2,
+                # macOS ignores -bg here, so the active tab is marked by a
+                # bold, fully black label rather than by its background.
+                fg=(BTN_FG if selected else BTN_FG2) if IS_MAC
+                   else ("#fff" if selected else FG2),
+                font=FONT_B if selected else FONT,
+            )
+
+    def _select_tab(self, index):
+        if index == self.selected_tab:
+            return
+        self.selected_tab = index
+        self._show_tab(index)
+        self._refresh_tabs()
+
+    def _show_tab(self, index):
+        self.pages[index].tkraise()
 
 def main():
     app = App()
