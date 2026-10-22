@@ -14,7 +14,7 @@ jobs:
           - runner: macos-latest    # Apple Silicon M1/M2/M3
             arch: arm64
             label: "Apple Silicon (M1+)"
-          - runner: macos-13        # Last Intel runner on GitHub
+          - runner: macos-15-intel    # Intel runner (macos-13 was retired)
             arch: x86_64
             label: "Intel"
 
@@ -37,16 +37,19 @@ jobs:
 
       - name: Download static ffmpeg
         run: |
-          # Pick the right ffmpeg build for this arch
+          # Static native build per arch (evermeet.cx only ships x86_64)
           if [ "${{ matrix.arch }}" = "arm64" ]; then
-            curl -L "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg.zip
+            FF_ARCH=arm64
           else
-            curl -L "https://evermeet.cx/ffmpeg/getrelease/zip" -o ffmpeg.zip
+            FF_ARCH=amd64
           fi
+          curl -fL --retry 3 --retry-delay 5 \
+            "https://ffmpeg.martin-riedl.de/redirect/latest/macos/${FF_ARCH}/release/ffmpeg.zip" \
+            -o ffmpeg.zip
           unzip -o ffmpeg.zip ffmpeg
           chmod +x ffmpeg
-          file ffmpeg
           echo "ffmpeg arch: $(file ffmpeg)"
+          ./ffmpeg -version | head -1
 
       - name: Build .app with PyInstaller
         run: |
