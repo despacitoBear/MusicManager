@@ -485,7 +485,6 @@ class MetadataTab(ttk.Frame):
         left.columnconfigure(0, weight=1)
 
         self.tree.bind("<<TreeviewSelect>>", self._on_select)
-        self.tree.bind("<Control-a>",        self._select_all)
 
         # ── Right: editor ────────────────────────────────────────────
         right = tk.Frame(pane, bg=BG)
@@ -605,10 +604,10 @@ class MetadataTab(ttk.Frame):
                 self.tag_vars[key].set("")
                 self.tag_enabled[key].set(False)
                 # Pack checkbox before the label in its row
+                check     = self.tag_checks[key]
                 row_frame = self.tag_entries[key].master
-                children  = row_frame.winfo_children()
-                self.tag_checks[key].pack(in_=row_frame, side="left",
-                                          before=children[0])
+                label     = next(w for w in row_frame.winfo_children() if w is not check)
+                check.pack(in_=row_frame, side="left", before=label)
                 self._toggle_field(key)
             self._refresh_save_label()
 
@@ -626,10 +625,15 @@ class MetadataTab(ttk.Frame):
         sel     = self.tree.selection()
         checked = sum(1 for v in self.tag_enabled.values() if v.get())
         n       = len(sel)
+        parts   = []
         if checked:
+            parts.append(f"{checked} field(s)")
+        if self.artwork_path:
+            parts.append("artwork")
+        if parts:
             self.save_btn.config(
                 state="normal",
-                text=f"\U0001f4be  Apply {checked} field(s) to {n} file(s)")
+                text=f"\U0001f4be  Apply {' + '.join(parts)} to {n} file(s)")
         else:
             self.save_btn.config(
                 state="disabled",
@@ -686,9 +690,6 @@ class MetadataTab(ttk.Frame):
         self._art_clear_preview()
         self._set_mode("none")
 
-    def _select_all(self, _event=None):
-        self.tree.selection_set(self.tree.get_children())
-
     # ── Selection ─────────────────────────────────────────────────────
 
     def _on_select(self, _event=None):
@@ -720,6 +721,7 @@ class MetadataTab(ttk.Frame):
         self.artwork_path = p
         self.art_label.config(text=Path(p).name, fg=FG)
         self._show_art_preview(p)
+        self._refresh_save_label()
 
     def _load_embedded_art(self, path):
         if not PILLOW_OK or not MUTAGEN_OK:
@@ -1565,6 +1567,10 @@ class App(tk.Tk):
         self.selected_tab = 0
         self._refresh_tabs()
         self._show_tab(0)
+        self.bind_all("<<SelectAll>>", self._on_select_all, add="+")
+        self.bind_all("<Control-a>", self._on_select_all, add="+")
+        mod = "Command" if IS_MAC else "Control"
+        self.bind_all(f"<{mod}-Cyrillic_ef>", self._on_select_all, add="+")
 
         # Deps warning
         missing = []
@@ -1601,6 +1607,16 @@ class App(tk.Tk):
 
     def _show_tab(self, index):
         self.pages[index].tkraise()
+
+    def _on_select_all(self, _event=None):
+        focus = self.focus_get()
+        if focus is not None and focus.winfo_class() in ("Entry", "TEntry", "Text"):
+            return None
+        tree = getattr(self.pages[self.selected_tab], "tree", None)
+        if tree is None:
+            return None
+        tree.selection_set(tree.get_children())
+        return "break"
 
 def main():
     app = App()
