@@ -5,6 +5,7 @@ Music Manager - Cross-platform GUI tool for:
  - Converting FLAC to MP3 / ALAC
  - Extracting audio from video files
  - Converting AVI/MOV to MP4
+ - Downloading from YouTube and SoundCloud (tracks, playlists, albums)
 
 Requirements:
   pip install mutagen Pillow
@@ -1223,6 +1224,69 @@ class VideoConvTab(ttk.Frame):
                 notify("Music Manager — Done", f"Video conversion complete. {summary}")
 
         threading.Thread(target=run, daemon=True).start()
+# ---------------------------------------------------------------------------
+# SoundCloud helpers (pure functions, no Tk)
+# ---------------------------------------------------------------------------
+
+SOUNDCLOUD_HOSTS = {"soundcloud.com", "www.soundcloud.com", "m.soundcloud.com",
+                    "on.soundcloud.com", "snd.sc"}
+
+def normalize_soundcloud_url(text):
+    """Return a clean https URL for a SoundCloud link, or None if it isn't one."""
+    from urllib.parse import urlparse
+    text = (text or "").strip()
+    if not text:
+        return None
+    if "://" not in text:
+        text = "https://" + text
+    parsed = urlparse(text)
+    if parsed.scheme not in ("http", "https") or parsed.hostname not in SOUNDCLOUD_HOSTS:
+        return None
+    if parsed.hostname != "on.soundcloud.com" and len(parsed.path.strip("/")) == 0:
+        return None
+    return text
+
+def soundcloud_ydl_opts(fmt, quality, outdir, ffmpeg_dir, is_playlist,
+                        progress_hook, log):
+    """Build yt-dlp options for a SoundCloud track or a whole set/album."""
+    from yt_dlp.postprocessor.metadataparser import MetadataParserPP
+    if is_playlist:
+        # One folder per playlist/album, files numbered in set order.
+        template = os.path.join(outdir, "%(playlist_title)s",
+                                "%(playlist_index)02d - %(title)s.%(ext)s")
+    else:
+        template = os.path.join(outdir, "%(title)s.%(ext)s")
+
+    opts = {
+        "format": "bestaudio/best",
+        "outtmpl": template,
+        "ffmpeg_location": ffmpeg_dir,
+        "progress_hooks": [progress_hook],
+        "logger": log,
+        "quiet": True, "no_warnings": True,
+        # One unavailable track must not abort the rest of the album.
+        "ignoreerrors": "only_download",
+        "noplaylist": False,
+    }
+    pps = []
+    if is_playlist:
+        pps.append({"key": "MetadataParser", "when": "pre_process", "actions": [
+            (MetadataParserPP.interpretter, "%(playlist_title)s", "%(album)s"),
+            (MetadataParserPP.interpretter, "%(playlist_index)s", "%(track_number)s"),
+        ]})
+    if fmt in ("mp3", "m4a"):
+        pp = {"key": "FFmpegExtractAudio", "preferredcodec": fmt}
+        if fmt == "mp3":
+            pp["preferredquality"] = quality.replace("k", "")
+        pps.append(pp)
+    pps.append({"key": "FFmpegMetadata", "add_metadata": True})
+    if fmt in ("mp3", "m4a"):
+        opts["writethumbnail"] = True
+        pps.append({"key": "FFmpegThumbnailsConvertor", "format": "jpg", "when": "before_dl"})
+        pps.append({"key": "EmbedThumbnail"})
+    opts["postprocessors"] = pps
+    return opts
+
 class YouTubeTab(ttk.Frame):
     def __init__(self, parent):
         super().__init__(parent, style="Dark.TFrame")
@@ -1505,6 +1569,259 @@ class YouTubeTab(ttk.Frame):
         self._jobs.clear()
         self.total_status.set("")
 
+class SoundCloudTab(ttk.Frame):
+    """Download SoundCloud tracks, playlists and albums (sets)."""
+
+    def __init__(self, parent):
+        super().__init__(parent, style="Dark.TFrame")
+        self._jobs    = []
+        self._running = False
+        self._build()
+
+    def _build(self):
+        top = tk.Frame(self, bg=BG2, pady=8)
+        top.pack(fill="x")
+        styled_label(top, "  URL:").pack(side="left", padx=(12, 4))
+        self.url_var = tk.StringVar()
+        ue = styled_entry(top, textvariable=self.url_var)
+        ue.pack(side="left", fill="x", expand=True, padx=4)
+        ue.bind("<Return>", lambda e: self._add_url())
+        styled_btn(top, "+ Add", self._add_url).pack(side="left", padx=4)
+        styled_btn(top, "Paste", self._paste_url).pack(side="left", padx=(0, 12))
+
+        opts = tk.Frame(self, bg=BG, pady=6)
+        opts.pack(fill="x", padx=12)
+        styled_label(opts, "Format:").pack(side="left")
+        self.fmt_var = tk.StringVar(value="mp3")
+        for fmt, label in (("mp3", "MP3"), ("m4a", "M4A"), ("original", "Original")):
+            tk.Radiobutton(opts, text=label, variable=self.fmt_var, value=fmt,
+                           bg=BG, fg=FG, selectcolor=BG2,
+                           activebackground=BG, activeforeground=FG,
+                           font=FONT, cursor="hand2").pack(side="left", padx=6)
+        tk.Frame(opts, bg=BG2, width=1, height=20).pack(side="left", padx=12)
+        styled_label(opts, "MP3 quality:").pack(side="left")
+        self.quality_var = tk.StringVar(value="320k")
+        styled_option(opts, self.quality_var, "320k", "192k", "128k").pack(side="left", padx=4)
+        tk.Frame(opts, bg=BG2, width=1, height=20).pack(side="left", padx=12)
+        styled_label(opts, "Save to:").pack(side="left")
+        self.outdir_var = tk.StringVar(value=str(Path.home() / "Downloads"))
+        styled_entry(opts, textvariable=self.outdir_var, width=28).pack(side="left", padx=4)
+        styled_btn(opts, "Browse", self._browse_outdir).pack(side="left")
+
+        hint = tk.Label(self, bg=BG, fg=FG2, font=(FONT[0], 9), anchor="w",
+                        text="Paste a SoundCloud track, playlist or album (set) link. "
+                             "Playlists/albums are saved into their own folder with numbered files.")
+        hint.pack(fill="x", padx=14)
+
+        list_frame = tk.Frame(self, bg=BG)
+        list_frame.pack(fill="both", expand=True, padx=12, pady=8)
+        hdr = tk.Frame(list_frame, bg=BTN_BG)
+        hdr.pack(fill="x")
+        for text, w in [("URL / Title", 52), ("Format", 8), ("Status", 26)]:
+            tk.Label(hdr, text=text, bg=BTN_BG, fg=FG2,
+                     font=(FONT[0], FONT[1], "bold"),
+                     width=w, anchor="w").pack(side="left", padx=4, pady=3)
+
+        cf = tk.Frame(list_frame, bg=BG)
+        cf.pack(fill="both", expand=True)
+        self.canvas = tk.Canvas(cf, bg=BG, highlightthickness=0)
+        vsb = tk.Scrollbar(cf, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
+        vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.job_frame = tk.Frame(self.canvas, bg=BG)
+        cw = self.canvas.create_window((0, 0), window=self.job_frame, anchor="nw")
+        self.job_frame.bind("<Configure>",
+            lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all")))
+        self.canvas.bind("<Configure>",
+            lambda e: self.canvas.itemconfig(cw, width=e.width))
+
+        bot = tk.Frame(self, bg=BG, pady=6)
+        bot.pack(fill="x", padx=12)
+        self.dl_btn = styled_btn(bot, "⬇  Download All", self._start_downloads,
+                                 bg=ACCENT, activebackground="#9a7ad8")
+        self.dl_btn.pack(side="left")
+        styled_btn(bot, "🗑  Clear Done", self._clear_done).pack(side="left", padx=8)
+        styled_btn(bot, "✖  Clear All", self._clear_all).pack(side="left")
+        self.total_status = tk.StringVar(value="")
+        tk.Label(bot, textvariable=self.total_status,
+                 bg=BG, fg=FG2, font=FONT).pack(side="right")
+
+        if not YTDLP_OK:
+            warn = tk.Frame(self, bg="#4a2020")
+            warn.pack(fill="x")
+            tk.Label(warn, text="⚠  yt-dlp not installed.  Run:  pip install yt-dlp",
+                     bg="#4a2020", fg="#ffaaaa", font=FONT).pack(padx=10, pady=4)
+
+    def _paste_url(self):
+        try:
+            txt = self.clipboard_get().strip()
+            if txt:
+                self.url_var.set(txt)
+        except Exception:
+            pass
+
+    def _browse_outdir(self):
+        d = filedialog.askdirectory(title="Select download folder")
+        if d:
+            self.outdir_var.set(d)
+
+    def _add_url(self):
+        raw = self.url_var.get().strip()
+        if not raw:
+            return
+        url = normalize_soundcloud_url(raw)
+        if not url:
+            messagebox.showwarning("Invalid URL",
+                "Please enter a SoundCloud link (track, playlist or album).")
+            return
+        fmt = self.fmt_var.get()
+
+        row = tk.Frame(self.job_frame, bg=BG2, pady=4)
+        row.pack(fill="x", pady=1)
+        short = url if len(url) <= 60 else url[:57] + "..."
+        url_lbl = tk.Label(row, text=short, bg=BG2, fg=FG, font=FONT, anchor="w", width=50)
+        url_lbl.pack(side="left", padx=6)
+        tk.Label(row, text=fmt.upper()[:8], bg=BG2, fg=FG2, font=FONT, width=6).pack(side="left")
+        status_var = tk.StringVar(value="Queued")
+        status_lbl = tk.Label(row, textvariable=status_var, bg=BG2, fg="#aaaacc",
+                              font=FONT, width=24, anchor="w")
+        status_lbl.pack(side="left", padx=4)
+        prog_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(row, variable=prog_var, maximum=100, length=110).pack(side="left", padx=4)
+
+        job = {"url": url, "fmt": fmt, "quality": self.quality_var.get(),
+               "status_var": status_var, "prog_var": prog_var,
+               "url_lbl": url_lbl, "status_lbl": status_lbl,
+               "row": row, "done": False, "error": False}
+
+        def remove(r=row, j=job):
+            if j in self._jobs:
+                self._jobs.remove(j)
+            r.destroy()
+        styled_btn(row, "✖", remove, padx=4, pady=1).pack(side="right", padx=4)
+        self._jobs.append(job)
+        self.url_var.set("")
+
+    def _start_downloads(self):
+        if self._running:
+            return
+        if not YTDLP_OK:
+            messagebox.showerror("yt-dlp missing",
+                "Install yt-dlp:\n  pip install yt-dlp\n\nThen restart the app.")
+            return
+        if not FFMPEG:
+            messagebox.showerror("ffmpeg missing", "ffmpeg is required for conversion.")
+            return
+        pending = [j for j in self._jobs if not j["done"] and not j["error"]]
+        if not pending:
+            self.total_status.set("Nothing to download.")
+            return
+        outdir = self.outdir_var.get()
+        self.dl_btn.config(state="disabled", text="⏳  Downloading...")
+        self._running = True
+
+        def run():
+            done = err = 0
+            for i, job in enumerate(pending):
+                self.total_status.set(f"Downloading {i+1}/{len(pending)}...")
+                if self._download_job(job, outdir):
+                    done += 1
+                else:
+                    err += 1
+            self.dl_btn.config(state="normal", text="⬇  Download All")
+            self._running = False
+            summary = f"Done: {done}  Errors: {err}"
+            self.total_status.set(summary)
+            if err:
+                notify("Music Manager — Download errors", f"{err} download(s) failed")
+            else:
+                notify("Music Manager — Downloads complete", summary)
+
+        threading.Thread(target=run, daemon=True).start()
+
+    def _download_job(self, job, outdir):
+        import yt_dlp
+
+        errors = []
+
+        class Log:
+            def debug(self, msg): pass
+            def info(self, msg): pass
+            def warning(self, msg): pass
+            def error(self, msg): errors.append(str(msg))
+
+        def progress_hook(d):
+            info = d.get("info_dict") or {}
+            idx, total = info.get("playlist_index"), info.get("n_entries")
+            prefix = f"[{idx}/{total}] " if idx and total else ""
+            if d["status"] == "downloading":
+                raw = d.get("_percent_str", "0%").strip().replace("%", "")
+                try:
+                    job["prog_var"].set(float(raw))
+                except ValueError:
+                    pass
+                job["status_var"].set(f"{prefix}{raw}%  {d.get('_speed_str', '').strip()}")
+            elif d["status"] == "finished":
+                job["prog_var"].set(100)
+                job["status_var"].set(f"{prefix}Converting...")
+
+        job["status_lbl"].config(fg="#ddbb55")
+        job["status_var"].set("Fetching info...")
+        try:
+            os.makedirs(outdir, exist_ok=True)
+            ffmpeg_dir = str(Path(FFMPEG).parent)
+            probe = {"quiet": True, "no_warnings": True, "extract_flat": "in_playlist",
+                     "logger": Log()}
+            with yt_dlp.YoutubeDL(probe) as ydl:
+                info = ydl.extract_info(job["url"], download=False)
+            if not info:
+                raise RuntimeError(errors[-1] if errors else "Could not read this link")
+            is_playlist = info.get("_type") == "playlist"
+            count = len(list(info.get("entries") or [])) if is_playlist else 1
+            title = info.get("title") or job["url"]
+            label = f"{title}  ({count} tracks)" if is_playlist else title
+            job["url_lbl"].config(text=label if len(label) <= 60 else label[:57] + "...")
+
+            ydl_opts = soundcloud_ydl_opts(job["fmt"], job["quality"], outdir,
+                                           ffmpeg_dir, is_playlist, progress_hook, Log())
+            job["status_var"].set("Downloading...")
+            errors.clear()
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([job["url"]])
+            if errors:
+                if is_playlist and len(errors) < count:
+                    job["done"] = True
+                    job["status_var"].set(f"✓  Done, {len(errors)} track(s) failed")
+                    job["status_lbl"].config(fg="#ddbb55")
+                    job["prog_var"].set(100)
+                    return True
+                raise RuntimeError(errors[-1])
+            job["done"] = True
+            job["status_var"].set("✓  Done")
+            job["status_lbl"].config(fg="#88dd88")
+            job["prog_var"].set(100)
+            return True
+        except Exception as e:
+            job["error"] = True
+            job["status_var"].set(f"✗  {str(e)[:70]}")
+            job["status_lbl"].config(fg="#ff7777")
+            return False
+
+    def _clear_done(self):
+        for job in list(self._jobs):
+            if job["done"] or job["error"]:
+                job["row"].destroy()
+                self._jobs.remove(job)
+
+    def _clear_all(self):
+        if self._running:
+            return
+        for job in list(self._jobs):
+            job["row"].destroy()
+        self._jobs.clear()
+        self.total_status.set("")
+
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
@@ -1534,7 +1851,7 @@ class App(tk.Tk):
 
         self.tab_names = [
             "🏷  Metadata Editor", "🔄  FLAC → MP3 / ALAC",
-            "🎬  Audio Extractor", "📹  Video → MP4", "▶  YouTube",
+            "🎬  Audio Extractor", "📹  Video → MP4", "▶  YouTube", "☁  SoundCloud",
         ]
         self.tab_bar = tk.Frame(self, bg=BG2, height=38)
         self.tab_bar.pack(fill="x")
@@ -1558,7 +1875,7 @@ class App(tk.Tk):
         tabs = [
             (self.tab_names[0], MetadataTab), (self.tab_names[1], FlacTab),
             (self.tab_names[2], ExtractTab), (self.tab_names[3], VideoConvTab),
-            (self.tab_names[4], YouTubeTab),
+            (self.tab_names[4], YouTubeTab), (self.tab_names[5], SoundCloudTab),
         ]
         self.page_container = page_container
         self.pages = [cls(page_container) for _, cls in tabs]
